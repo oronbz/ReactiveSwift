@@ -7,7 +7,7 @@
 //
 
 import Foundation
-
+import Dispatch
 import Result
 import Nimble
 import Quick
@@ -264,6 +264,39 @@ class PropertySpec: QuickSpec {
 
 				property = nil
 				expect(isEnded) == true
+			}
+
+			it("should not deadlock") {
+				let queue: DispatchQueue
+
+				if #available(macOS 10.10, *) {
+					queue = DispatchQueue.global(qos: .userInteractive)
+				} else {
+					queue = DispatchQueue.global(priority: .high)
+				}
+
+				let group = DispatchGroup()
+
+				DispatchQueue.concurrentPerform(iterations: 500) { _ in
+					let source = MutableProperty(1)
+					var target = Optional(MutableProperty(1))
+
+					let semaphore = DispatchSemaphore(value: 0)
+
+					target! <~ source
+
+					queue.async(group: group) {
+						semaphore.wait()
+						target = nil
+					}
+
+					queue.async(group: group) {
+						semaphore.signal()
+						source.value = 2
+					}
+				}
+
+				group.wait()
 			}
 		}
 
@@ -578,7 +611,7 @@ class PropertySpec: QuickSpec {
 
 						let (signal, observer) = Signal<Int, NoError>.pipe()
 						var property: Property<Int>? = Property(initial: 1,
-																											 then: SignalProducer(signal: signal))
+						                                        then: SignalProducer(signal))
 						let propertySignal = property!.signal
 
 						propertySignal.observeCompleted { signalCompleted = true }
@@ -1539,7 +1572,7 @@ class PropertySpec: QuickSpec {
 			describe("from a SignalProducer") {
 				it("should start a signal and update the property with its values") {
 					let signalValues = [initialPropertyValue, subsequentPropertyValue]
-					let signalProducer = SignalProducer<String, NoError>(values: signalValues)
+					let signalProducer = SignalProducer<String, NoError>(signalValues)
 
 					let mutableProperty = MutableProperty(initialPropertyValue)
 
@@ -1562,7 +1595,7 @@ class PropertySpec: QuickSpec {
 
 				it("should tear down the binding when the property deallocates") {
 					let (signal, _) = Signal<String, NoError>.pipe()
-					let signalProducer = SignalProducer(signal: signal)
+					let signalProducer = SignalProducer(signal)
 
 					var mutableProperty: MutableProperty<String>? = MutableProperty(initialPropertyValue)
 

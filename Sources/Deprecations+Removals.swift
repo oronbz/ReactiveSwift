@@ -297,6 +297,12 @@ extension SignalProducerProtocol where Error == NoError {
 extension SignalProducer {
 	@available(*, unavailable, message:"Use properties instead. `buffer(_:)` is removed in RAC 5.0.")
 	public static func buffer(_ capacity: Int) -> (SignalProducer, Signal<Value, Error>.Observer) { fatalError() }
+
+	@available(*, unavailable, renamed:"init(_:)")
+	public init<S: SignalProtocol>(signal: S) where S.Value == Value, S.Error == Error { fatalError() }
+
+	@available(*, unavailable, renamed:"init(_:)")
+	public init<S: Sequence>(values: S) where S.Iterator.Element == Value { fatalError() }
 }
 
 extension PropertyProtocol {
@@ -356,6 +362,11 @@ extension NotificationCenter {
 extension URLSession {
 	@available(*, unavailable, renamed:"reactive.data")
 	public func rac_data(with request: URLRequest) -> SignalProducer<(Data, URLResponse), NSError> { fatalError() }
+}
+
+extension Reactive where Base: URLSession {
+	@available(*, unavailable, message:"Use the overload which returns `SignalProducer<(Data, URLResponse), AnyError>` instead, and cast `AnyError.error` to `NSError` as you need")
+	public func data(with request: URLRequest) -> SignalProducer<(Data, URLResponse), NSError> { fatalError() }
 }
 
 // Free functions

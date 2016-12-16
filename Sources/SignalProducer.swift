@@ -29,7 +29,7 @@ public struct SignalProducer<Value, Error: Swift.Error> {
 	///
 	/// - parameters:
 	///   - signal: A signal to observe after starting the producer.
-	public init<S: SignalProtocol>(signal: S) where S.Value == Value, S.Error == Error {
+	public init<S: SignalProtocol>(_ signal: S) where S.Value == Value, S.Error == Error {
 		self.init { observer, disposable in
 			disposable += signal.observe(observer)
 		}
@@ -100,7 +100,7 @@ public struct SignalProducer<Value, Error: Swift.Error> {
 	/// - parameters:
 	///   - values: A sequence of values that a `Signal` will send as separate
 	///             `value` events and then complete.
-	public init<S: Sequence>(values: S) where S.Iterator.Element == Value {
+	public init<S: Sequence>(_ values: S) where S.Iterator.Element == Value {
 		self.init { observer, disposable in
 			for value in values {
 				observer.send(value: value)
@@ -122,7 +122,7 @@ public struct SignalProducer<Value, Error: Swift.Error> {
 	///   - second: Second value for the `Signal` to send.
 	///   - tail: Rest of the values to be sent by the `Signal`.
 	public init(values first: Value, _ second: Value, _ tail: Value...) {
-		self.init(values: [ first, second ] + tail)
+		self.init([ first, second ] + tail)
 	}
 
 	/// A producer for a Signal that will immediately complete without sending
@@ -448,7 +448,7 @@ extension SignalProducerProtocol {
 	///            `SignalProducer`.
 	public func lift<U, F, V, G>(_ transform: @escaping (Signal<Value, Error>) -> (Signal<U, F>) -> Signal<V, G>) -> (Signal<U, F>) -> SignalProducer<V, G> {
 		return { otherSignal in
-			return self.liftRight(transform)(SignalProducer(signal: otherSignal))
+			return self.liftRight(transform)(SignalProducer(otherSignal))
 		}
 	}
 
@@ -778,6 +778,44 @@ extension SignalProducerProtocol {
 	///            interrupted.
 	public func sample(on sampler: Signal<(), NoError>) -> SignalProducer<Value, Error> {
 		return lift(Signal.sample(on:))(sampler)
+	}
+
+	/// Forward the latest value from `samplee` with the value from `self` as a
+	/// tuple, only when `self` sends a `value` event.
+	/// This is like a flipped version of `sample(with:)`, but `samplee`'s
+	/// terminal events are completely ignored.
+	///
+	/// - note: If `self` fires before a value has been observed on `samplee`,
+	///         nothing happens.
+	///
+	/// - parameters:
+	///   - samplee: A producer whose latest value is sampled by `self`.
+	///
+	/// - returns: A signal that will send values from `self` and `samplee`,
+	///            sampled (possibly multiple times) by `self`, then terminate
+	///            once `self` has terminated. **`samplee`'s terminated events
+	///            are ignored**.
+	public func withLatest<U>(from samplee: SignalProducer<U, NoError>) -> SignalProducer<(Value, U), Error> {
+		return liftRight(Signal.withLatest)(samplee)
+	}
+
+	/// Forward the latest value from `samplee` with the value from `self` as a
+	/// tuple, only when `self` sends a `value` event.
+	/// This is like a flipped version of `sample(with:)`, but `samplee`'s
+	/// terminal events are completely ignored.
+	///
+	/// - note: If `self` fires before a value has been observed on `samplee`,
+	///         nothing happens.
+	///
+	/// - parameters:
+	///   - samplee: A signal whose latest value is sampled by `self`.
+	///
+	/// - returns: A signal that will send values from `self` and `samplee`,
+	///            sampled (possibly multiple times) by `self`, then terminate
+	///            once `self` has terminated. **`samplee`'s terminated events
+	///            are ignored**.
+	public func withLatest<U>(from samplee: Signal<U, NoError>) -> SignalProducer<(Value, U), Error> {
+		return lift(Signal.withLatest)(samplee)
 	}
 
 	/// Forwards events from `self` until `lifetime` ends, at which point the
