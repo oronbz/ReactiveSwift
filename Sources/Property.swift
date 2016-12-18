@@ -5,6 +5,9 @@ import enum Result.NoError
 ///
 /// Only classes can conform to this protocol, because having a signal
 /// for changes over time implies the origin must have a unique identity.
+///
+/// Conforming types are required to use a recursive lock if it needs
+/// serialization.
 public protocol PropertyProtocol: class, BindingSourceProtocol {
 	associatedtype Value
 
@@ -22,6 +25,10 @@ public protocol PropertyProtocol: class, BindingSourceProtocol {
 	/// completes when the property has deinitialized, or has no further
 	/// change.
 	var signal: Signal<Value, NoError> { get }
+
+	/// Perform an arbitrary action on the current value of the property.
+	/// Serialized properties should invoke `body` in its protected section.
+	func withValue<R>(_ body: (Value) throws -> R) rethrows -> R
 }
 
 extension PropertyProtocol {
@@ -52,15 +59,38 @@ extension MutablePropertyProtocol {
 /// A composed property would retain its ultimate source, but not
 /// any intermediate property during the composition.
 extension PropertyProtocol {
-	/// Lifts a unary SignalProducer operator to operate upon PropertyProtocol instead.
-	fileprivate func lift<U>(_ transform: @escaping (SignalProducer<Value, NoError>) -> SignalProducer<U, NoError>) -> Property<U> {
-		return Property(self, transform: transform)
+	/// Lifts a unary Signal operator to operate upon PropertyProtocol instead.
+	fileprivate func lift<U>(_ transform: @escaping (Signal<Value, NoError>) -> Signal<U, NoError>) -> Property<U> {
+		return withValue { value in
+			let (relaySignal, relayObserver) = Signal<Value, NoError>.pipe()
+
+			return Property<U>(signal: transform(relaySignal)) {
+				relayObserver.send(value: value)
+				self.signal.propertyObserve(relayObserver)
+			}
+		}
 	}
 
-	/// Lifts a binary SignalProducer operator to operate upon PropertyProtocol instead.
-	fileprivate func lift<P: PropertyProtocol, U>(_ transform: @escaping (SignalProducer<Value, NoError>) -> (SignalProducer<P.Value, NoError>) -> SignalProducer<U, NoError>) -> (P) -> Property<U> {
-		return { otherProperty in
-			return Property(self, otherProperty, transform: transform)
+	/// Lifts a binary Signal operator to operate upon PropertyProtocol instead.
+	fileprivate func lift<P: PropertyProtocol, U>(_ transform: @escaping (Signal<Value, NoError>) -> (Signal<P.Value, NoError>) -> Signal<U, NoError>) -> (P) -> Property<U> {
+		return { other in
+			return self.withValue { value1 in
+				return other.withValue { value2 in
+					let disposableSelf = SerialDisposable()
+					let disposableOther = SerialDisposable()
+
+					let (relaySelfSignal, relaySelfObserver) = Signal<Value, NoError>.pipe(disposable: disposableSelf)
+					let (relayOtherSignal, relayOtherObserver) = Signal<P.Value, NoError>.pipe(disposable: disposableOther)
+
+					return Property<U>(signal: transform(relaySelfSignal)(relayOtherSignal)) {
+						relaySelfObserver.send(value: value1)
+						relayOtherObserver.send(value: value2)
+
+						disposableSelf.innerDisposable = self.signal.propertyObserve(relaySelfObserver)
+						disposableOther.innerDisposable = other.signal.propertyObserve(relayOtherObserver)
+					}
+				}
+			}
 		}
 	}
 
@@ -85,7 +115,7 @@ extension PropertyProtocol {
 	/// - returns: A property that holds a tuple containing values of `self` and
 	///            the given property.
 	public func combineLatest<P: PropertyProtocol>(with other: P) -> Property<(Value, P.Value)> {
-		return lift(SignalProducer.combineLatest(with:))(other)
+		return lift(Signal.combineLatest(with:))(other)
 	}
 
 	/// Zips the current value and the subsequent values of two `Property`s in
@@ -97,7 +127,7 @@ extension PropertyProtocol {
 	/// - returns: A property that holds a tuple containing values of `self` and
 	///            the given property.
 	public func zip<P: PropertyProtocol>(with other: P) -> Property<(Value, P.Value)> {
-		return lift(SignalProducer.zip(with:))(other)
+		return lift(Signal.zip(with:))(other)
 	}
 
 	/// Forward events from `self` with history: values of the returned property
@@ -396,8 +426,7 @@ public final class Property<Value>: PropertyProtocol {
 	private let disposable: Disposable?
 
 	private let _value: () -> Value
-	private let _producer: () -> SignalProducer<Value, NoError>
-	private let _signal: () -> Signal<Value, NoError>
+	private let box: PropertyBoxBase<Value>
 
 	/// The current value of the property.
 	public var value: Value {
@@ -407,15 +436,11 @@ public final class Property<Value>: PropertyProtocol {
 	/// A producer for Signals that will send the property's current
 	/// value, followed by all changes over time, then complete when the
 	/// property has deinitialized or has no further changes.
-	public var producer: SignalProducer<Value, NoError> {
-		return _producer()
-	}
+	public let producer: SignalProducer<Value, NoError>
 
 	/// A signal that will send the property's changes over time, then
 	/// complete when the property has deinitialized or has no further changes.
-	public var signal: Signal<Value, NoError> {
-		return _signal()
-	}
+	public let signal: Signal<Value, NoError>
 
 	/// Initializes a constant property.
 	///
@@ -424,8 +449,9 @@ public final class Property<Value>: PropertyProtocol {
 	public init(value: Value) {
 		disposable = nil
 		_value = { value }
-		_producer = { SignalProducer(value: value) }
-		_signal = { Signal<Value, NoError>.empty }
+		producer = SignalProducer(value: value)
+		signal = .empty
+		box = PropertyBox<Property<Value>>(constant: value)
 	}
 
 	/// Initializes an existential property which wraps the given property.
@@ -437,8 +463,9 @@ public final class Property<Value>: PropertyProtocol {
 	public init<P: PropertyProtocol>(capturing property: P) where P.Value == Value {
 		disposable = nil
 		_value = { property.value }
-		_producer = { property.producer }
-		_signal = { property.signal }
+		producer = property.producer
+		signal = property.signal
+		box = PropertyBox(property)
 	}
 
 	/// Initializes a composed property which reflects the given property.
@@ -448,7 +475,15 @@ public final class Property<Value>: PropertyProtocol {
 	/// - parameters:
 	///   - property: A property to be wrapped.
 	public convenience init<P: PropertyProtocol>(_ property: P) where P.Value == Value {
-		self.init(unsafeProducer: property.producer)
+		let disposable = SerialDisposable()
+		let (relaySignal, relayObserver) = Signal<Value, NoError>.pipe(disposable: disposable)
+
+		self.init(signal: relaySignal) {
+			property.withValue { value in
+				relayObserver.send(value: value)
+				disposable.innerDisposable = property.signal.propertyObserve(relayObserver)
+			}
+		}
 	}
 
 	/// Initializes a composed property that first takes on `initial`, then each
@@ -459,7 +494,16 @@ public final class Property<Value>: PropertyProtocol {
 	///   - values: A producer that will start immediately and send values to
 	///             the property.
 	public convenience init(initial: Value, then values: SignalProducer<Value, NoError>) {
-		self.init(unsafeProducer: values.prefix(value: initial))
+		let disposable = SerialDisposable()
+		let (relaySignal, relayObserver) = Signal<Value, NoError>.pipe(disposable: disposable)
+
+		self.init(signal: relaySignal) {
+			relayObserver.send(value: initial)
+			values.startWithSignal { signal, interrupter in
+				disposable.innerDisposable = interrupter
+				signal.propertyObserve(relayObserver)
+			}
+		}
 	}
 
 	/// Initialize a composed property that first takes on `initial`, then each
@@ -469,70 +513,111 @@ public final class Property<Value>: PropertyProtocol {
 	///   - initialValue: Starting value for the property.
 	///   - values: A signal that will send values to the property.
 	public convenience init(initial: Value, then values: Signal<Value, NoError>) {
-		self.init(unsafeProducer: SignalProducer(values).prefix(value: initial))
+		let disposable = SerialDisposable()
+		let (relaySignal, relayObserver) = Signal<Value, NoError>.pipe(disposable: disposable)
+
+		self.init(signal: relaySignal) {
+			relayObserver.send(value: initial)
+			disposable.innerDisposable = values.propertyObserve(relayObserver)
+		}
 	}
 
-	/// Initialize a composed property by applying the unary `SignalProducer`
-	/// transform on `property`.
-	///
-	/// - parameters:
-	///   - property: The source property.
-	///   - transform: A unary `SignalProducer` transform to be applied on
-	///     `property`.
-	fileprivate convenience init<P: PropertyProtocol>(
-		_ property: P,
-		transform: @escaping (SignalProducer<P.Value, NoError>) -> SignalProducer<Value, NoError>
+	fileprivate init(
+		signal: Signal<Value, NoError>,
+		producerTransform: (SignalProducer<Value, NoError>) -> SignalProducer<Value, NoError> = { $0 },
+		_ setup: () -> Void
 	) {
-		self.init(unsafeProducer: transform(property.producer))
-	}
+		let atomic = RecursiveAtomic<Value?>(nil)
+		disposable = signal.observeValues { atomic.value = $0 }
 
-	/// Initialize a composed property by applying the binary `SignalProducer`
-	/// transform on `firstProperty` and `secondProperty`.
-	///
-	/// - parameters:
-	///   - firstProperty: The first source property.
-	///   - secondProperty: The first source property.
-	///   - transform: A binary `SignalProducer` transform to be applied on
-	///             `firstProperty` and `secondProperty`.
-	fileprivate convenience init<P1: PropertyProtocol, P2: PropertyProtocol>(_ firstProperty: P1, _ secondProperty: P2, transform: @escaping (SignalProducer<P1.Value, NoError>) -> (SignalProducer<P2.Value, NoError>) -> SignalProducer<Value, NoError>) {
-		self.init(unsafeProducer: transform(firstProperty.producer)(secondProperty.producer))
-	}
+		setup()
 
-	/// Initialize a composed property from a producer that promises to send
-	/// at least one value synchronously in its start handler before sending any
-	/// subsequent event.
-	///
-	/// - important: The producer and the signal of the created property would
-	///              complete only when the `unsafeProducer` completes.
-	///
-	/// - warning: If the producer fails its promise, a fatal error would be
-	///            raised.
-	///
-	/// - parameters:
-	///   - unsafeProducer: The composed producer for creating the property.
-	private init(unsafeProducer: SignalProducer<Value, NoError>) {
-		// Share a replayed producer with `self.producer` and `self.signal` so
-		// they see a consistent view of the `self.value`.
-		// https://github.com/ReactiveCocoa/ReactiveCocoa/pull/3042
-		let producer = unsafeProducer.replayLazily(upTo: 1)
-
-		let atomic = Atomic<Value?>(nil)
-		disposable = producer.startWithValues { atomic.value = $0 }
-
-		// Verify that an initial is sent. This is friendlier than deadlocking
-		// in the event that one isn't.
 		guard atomic.value != nil else {
-			fatalError("A producer promised to send at least one value. Received none.")
+			fatalError("Expected a value being synchronously sent. Got none.")
 		}
 
 		_value = { atomic.value! }
-		_producer = { producer }
-		_signal = { producer.startAndRetrieveSignal() }
+		producer = producerTransform(SignalProducer<Value, NoError> { observer, disposable in
+			atomic.withValue { value in
+				observer.send(value: value!)
+				disposable += signal.propertyObserve(observer)
+			}
+		})
+		self.signal = signal
+		box = PropertyBox<Property<Value>>(atomic)
+	}
+
+	public func withValue<R>(_ body: (Value) throws -> R) rethrows -> R {
+		return try box.withValue(body)
 	}
 
 	deinit {
 		disposable?.dispose()
 	}
+}
+
+extension SignalProtocol {
+	/// `observe` for property composition. It turns `interrupted` into
+	/// `completed`, and traps on `failed`.
+	@discardableResult
+	fileprivate func propertyObserve(_ observer: Observer<Value, Error>) -> Disposable? {
+		return observe { event in
+			switch event {
+			case .value, .completed:
+				observer.action(event)
+
+			case .interrupted:
+				observer.sendCompleted()
+
+			case let .failed(error):
+				fatalError("Received `failed` event in a `Property` which should never fail. \(error)")
+			}
+		}
+	}
+}
+
+// The existential box for `PropertyProtocol.withValue`.
+private class PropertyBox<P: PropertyProtocol>: PropertyBoxBase<P.Value> {
+	private let base: PropertyBoxBacking<P>
+
+	fileprivate init(_ base: P) {
+		self.base = .property(base)
+	}
+
+	fileprivate init(_ atomic: RecursiveAtomic<P.Value?>) {
+		self.base = .composed(atomic)
+	}
+
+	fileprivate init(constant: P.Value) {
+		self.base = .constant(constant)
+	}
+
+	fileprivate override func withValue<R>(_ body: (P.Value) throws -> R) rethrows -> R {
+		switch base {
+		case let .constant(value):
+			return try body(value)
+
+		case let .composed(atomic):
+			return try atomic.withValue { try body($0!) }
+
+		case let .property(property):
+			return try property.withValue(body)
+		}
+	}
+}
+
+// The base class of the existential box.
+private class PropertyBoxBase<Value> {
+	fileprivate func withValue<R>(_ body: (Value) throws -> R) rethrows -> R {
+		fatalError("This method should have been overriden.")
+	}
+}
+
+// The backing the existential box.
+private enum PropertyBoxBacking<P: PropertyProtocol> {
+	case constant(P.Value)
+	case composed(RecursiveAtomic<P.Value?>)
+	case property(P)
 }
 
 /// A mutable property of type `Value` that allows observation of its changes.
@@ -612,25 +697,25 @@ public final class MutableProperty<Value>: MutablePropertyProtocol {
 	/// Atomically modifies the variable.
 	///
 	/// - parameters:
-	///   - action: A closure that accepts old property value and returns a new
-	///             property value.
+	///   - body: A closure that accepts old property value and returns a new
+	///           property value.
 	///
-	/// - returns: The result of the action.
+	/// - returns: The result of the closure.
 	@discardableResult
-	public func modify<Result>(_ action: (inout Value) throws -> Result) rethrows -> Result {
-		return try atomic.modify(action)
+	public func modify<Result>(_ body: (inout Value) throws -> Result) rethrows -> Result {
+		return try atomic.modify(body)
 	}
 
 	/// Atomically performs an arbitrary action using the current value of the
 	/// variable.
 	///
 	/// - parameters:
-	///   - action: A closure that accepts current property value.
+	///   - body: A closure that accepts current property value.
 	///
-	/// - returns: the result of the action.
+	/// - returns: the result of the closure.
 	@discardableResult
-	public func withValue<Result>(action: (Value) throws -> Result) rethrows -> Result {
-		return try atomic.withValue(action)
+	public func withValue<Result>(_ body: (Value) throws -> Result) rethrows -> Result {
+		return try atomic.withValue(body)
 	}
 
 	deinit {
