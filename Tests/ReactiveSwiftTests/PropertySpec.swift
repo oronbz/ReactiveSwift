@@ -298,6 +298,67 @@ class PropertySpec: QuickSpec {
 
 				group.wait()
 			}
+
+			it("should not drop the value") {
+				let queue: DispatchQueue
+
+				if #available(macOS 10.10, *) {
+					queue = DispatchQueue.global(qos: .userInteractive)
+				} else {
+					queue = DispatchQueue.global(priority: .high)
+				}
+
+				let group = DispatchGroup()
+
+				let counter1 = Atomic(0)
+				let counter2 = Atomic(0)
+				let counter3 = Atomic(0)
+
+				DispatchQueue.concurrentPerform(iterations: 500) { _ in
+					let source = MutableProperty(1)
+					var mapped = source.map { $0 }
+
+					let s1 = DispatchSemaphore(value: 0)
+					let s2 = DispatchSemaphore(value: 0)
+
+					queue.async(group: group) {
+						s1.wait()
+						source.value = 2
+						source.value = 3
+						s2.signal()
+					}
+
+					queue.async(group: group) {
+						var caught1 = false
+						var caught2 = false
+						var caught3 = false
+
+						var d: Disposable?
+
+						mapped.producer.startWithSignal { signal, disposable in
+							d = disposable
+							signal.observeValues { v in
+								s1.signal()
+								if v == 1 { caught1 = true }
+								if v == 2 { caught2 = true }
+								if v == 3 { caught3 = true }
+							}
+						}
+
+						s2.wait()
+
+						counter1.modify { $0 += caught1 ? 1 : 0 }
+						counter2.modify { $0 += caught2 ? 1 : 0 }
+						counter3.modify { $0 += caught3 ? 1 : 0 }
+					}
+				}
+				
+				group.wait()
+
+				expect(counter1.value) == 500
+				expect(counter2.value) == 500
+				expect(counter3.value) == 500
+			}
 		}
 
 		describe("Property") {
