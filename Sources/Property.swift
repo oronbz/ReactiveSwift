@@ -62,11 +62,12 @@ extension PropertyProtocol {
 	/// Lifts a unary Signal operator to operate upon PropertyProtocol instead.
 	fileprivate func lift<U>(_ transform: @escaping (Signal<Value, NoError>) -> Signal<U, NoError>) -> Property<U> {
 		return withValue { value in
-			let (relaySignal, relayObserver) = Signal<Value, NoError>.pipe()
+			let disposable = SerialDisposable()
+			let (relaySignal, relayObserver) = Signal<Value, NoError>.pipe(disposable: disposable)
 
 			return Property<U>(signal: transform(relaySignal)) {
 				relayObserver.send(value: value)
-				self.signal.propertyObserve(relayObserver)
+				disposable.innerDisposable = self.signal.propertyObserve(relayObserver)
 			}
 		}
 	}
@@ -104,6 +105,31 @@ extension PropertyProtocol {
 	///            from `self`.
 	public func map<U>(_ transform: @escaping (Value) -> U) -> Property<U> {
 		return lift { $0.map(transform) }
+	}
+
+	/// Create a property which forwards all events of `self` onto the given
+	/// scheduler, instead of whichever scheduler they originally arrived upon.
+	///
+	/// - parameters:
+	///   - scheduler: A scheduler to deliver events on.
+	///
+	/// - returns: A property that forwards all events on the given scheduler.
+	public func observe(on scheduler: SchedulerProtocol) -> Property<Value> {
+		let disposable = SerialDisposable()
+		let (relaySignal, relayObserver) = Signal<Value, NoError>.pipe(disposable: disposable)
+
+		let setup = {
+			self.withValue { value in
+				relayObserver.send(value: value)
+				disposable.innerDisposable = self.signal
+					.observe(on: scheduler)
+					.observe(relayObserver)
+			}
+		}
+
+		return Property(signal: relaySignal,
+		                producerTransform: { $0.start(on: scheduler) },
+		                setup)
 	}
 
 	/// Combines the current value and the subsequent values of two `Property`s in
